@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Auto War IRS UI — Navigator (Login → Portal → IRS) 2
+// @name         Auto War IRS UI — Navigator (Login → Portal → IRS)
 // @version      2.3
 // @match        https://slcm.ui.ac.id/*
 // @match        https://login.ui.ac.id/*
