@@ -1,0 +1,131 @@
+// ==UserScript==
+// @name         Auto War IRS UI — Navigator (Login → Portal → IRS)
+// @version      2.1
+// @match        https://slcm.ui.ac.id/*
+// @match        https://login.ui.ac.id/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  /* ================= KONFIGURASI ================= */
+  const CONFIG = {
+    username: "USERNAME",     // username/email SSO
+    password: "PASSWORD",     // password SSO
+    jamWar: "00:00:00",             // HH:MM:SS waktu lokal
+    delayDetik: 3,                  // eksekusi beberapa detik setelah jam war
+    jendelaMenit: 15,               // alur otomatis aktif s/d jamWar + X menit
+  };
+
+  const URL_IRS = "https://slcm.ui.ac.id/akademik/pengisian-irs?optimized=true";
+  const URL_HOME_AKADEMIK = "https://slcm.ui.ac.id/akademik/student/home";
+
+  /* ================= UTIL ================= */
+  const log = (...a) => console.log("[auto-war]", ...a);
+
+  const [hh, mm, ss] = CONFIG.jamWar.split(":").map(Number);
+  const T = (() => { const d = new Date(); d.setHours(hh, mm, ss, 0);
+    return d.getTime() + CONFIG.delayDetik * 1000; })();
+  const T_END = T + CONFIG.jendelaMenit * 60_000;
+
+  // Eksekusi cb tepat di waktu T; kalau sudah lewat T langsung jalan;
+  // kalau lewat jendela waktu, stage pasif (biar browsing biasa tidak terganggu).
+  function jadwal(cb) {
+    const now = Date.now();
+    if (now > T_END) { log("di luar jendela waktu → stage pasif"); return; }
+    if (now >= T) { cb(); return; }
+    log("standby... eksekusi pukul", new Date(T).toLocaleTimeString());
+    const iv = setInterval(() => {
+      if (Date.now() >= T) { clearInterval(iv); cb(); }
+    }, 50);
+  }
+
+  function poll(fn, timeout = 90_000, interval = 100) {
+    const start = Date.now();
+    const iv = setInterval(() => {
+      let ok = false;
+      try { ok = fn(); } catch (e) {}
+      if (ok) clearInterval(iv);
+      else if (Date.now() - start > timeout) { clearInterval(iv); log("poll timeout"); }
+    }, interval);
+  }
+
+  function tombolTeks(re) {
+    return [...document.querySelectorAll("a,button,input[type='submit']")]
+      .find((el) => re.test(el.textContent.trim()));
+  }
+
+  // Isi input dengan cara yang dikenali framework (React/Vue/etc)
+  function setVal(el, val) {
+    const proto = el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, val);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  const host = location.hostname;
+  const path = location.pathname;
+
+  /* ============ STAGE 1: landing slcm ============ */
+  if (host === "slcm.ui.ac.id" && (path === "/" || path === "")) {
+    jadwal(() => poll(() => {
+      const masuk = tombolTeks(/^(login|masuk)$/i);
+      if (masuk) { log("klik tombol Login/Masuk"); masuk.click(); return true; }
+      if (tombolTeks(/^logout$/i)) { log("sudah login → lompat ke IRS"); location.assign(URL_IRS); return true; }
+      return false;
+    }, 60_000));
+  }
+
+  /* ============ STAGE 2: halaman SSO ============ */
+  else if (host === "login.ui.ac.id") {
+    jadwal(() => poll(() => {
+      const u = document.querySelector("input[placeholder*='Username' i]") ||
+                document.querySelector("input[type='text']");
+      const p = document.querySelector("input[type='password']");
+      const b = tombolTeks(/^sign\s*in$/i);
+      if (!u || !p || !b) return false;
+      setVal(u, CONFIG.username);
+      setVal(p, CONFIG.password);
+      log("isi kredensial & submit SSO");
+      b.click();
+      return true;
+    }));
+  }
+
+  /* ============ STAGE 3: portal "Pilih Tujuan Anda" ============ */
+  else if (host === "slcm.ui.ac.id" && path.startsWith("/portal")) {
+    jadwal(() => {
+      let done = false;
+      const iv = setInterval(() => {
+        const daun = [...document.querySelectorAll("h1,h2,h3,h4,h5,div,span,p,b,strong")]
+          .find((el) => el.childElementCount === 0 && el.textContent.trim() === "Akademik");
+        if (!daun) return;
+        let el = daun;
+        for (let i = 0; i < 6 && el; i++) {
+          if (el.tagName === "A" || getComputedStyle(el).cursor === "pointer") break;
+          el = el.parentElement;
+        }
+        (el || daun).click();
+        log("klik kartu Akademik");
+        done = true; clearInterval(iv);
+      }, 200);
+      setTimeout(() => {
+        clearInterval(iv);
+        if (!done) { log("fallback → home akademik"); location.assign(URL_HOME_AKADEMIK); }
+      }, 3000);
+    });
+  }
+
+  /* ============ STAGE 4: home akademik → halaman IRS ============ */
+  else if (host === "slcm.ui.ac.id" && path.startsWith("/akademik") &&
+           !path.includes("pengisian-irs")) {
+    jadwal(() => { log("menuju halaman pengisian IRS"); location.assign(URL_IRS); });
+  }
+
+  /* Halaman pengisian-irs SENGAJA tidak disentuh script ini.
+     Auto-ceklis v1.8 (script terpisah, tidak diubah) yang bertugas di sana.
+     Tidak ada kode yang menyentuh "Simpan Draf" / "Kirim Pengajuan IRS". */
+})();
