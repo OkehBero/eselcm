@@ -1,0 +1,182 @@
+// ==UserScript==
+// @name         Auto War IRS UI — Navigator (Login → Portal → IRS) 2
+// @version      2.3
+// @match        https://slcm.ui.ac.id/*
+// @match        https://login.ui.ac.id/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  /* ================= KONFIGURASI ================= */
+  const CONFIG = {
+    username: "USERNAME",
+    password: "PASSWORD",
+    jamWar: "00:00:00",
+    delayDetik: 3,
+    jendelaMenit: 15,
+  };
+
+  const URL_IRS = "https://slcm.ui.ac.id/akademik/pengisian-irs?optimized=true";
+  const URL_HOME_AKADEMIK = "https://slcm.ui.ac.id/akademik/student/home";
+
+  /* ================= UTIL ================= */
+  const log = (...a) => console.log("[auto-war]", ...a);
+
+  const [hh, mm, ss] = CONFIG.jamWar.split(":").map(Number);
+  const T = (() => { const d = new Date(); d.setHours(hh, mm, ss, 0);
+    return d.getTime() + CONFIG.delayDetik * 1000; })();
+  const T_END = T + CONFIG.jendelaMenit * 60_000;
+
+  const dt = () => {
+    const s = (Date.now() - T) / 1000;
+    return (s >= 0 ? "T+" : "T-") + Math.abs(s).toFixed(1) + "s";
+  };
+
+  const timeoutDinamis = () => Math.max(120_000, T_END - Date.now() + 60_000);
+
+  function poll(fn, timeout, interval = 100) {
+    const start = Date.now();
+    const lim = timeout ?? timeoutDinamis();
+    const iv = setInterval(() => {
+      let ok = false;
+      try { ok = fn(); } catch (e) {}
+      if (ok) clearInterval(iv);
+      else if (Date.now() - start > lim) { clearInterval(iv); log("poll timeout"); }
+    }, interval);
+  }
+
+  function tombolTeks(re) {
+    return [...document.querySelectorAll("a,button,input[type='submit']")]
+      .find((el) => re.test(el.textContent.trim()));
+  }
+
+  function setVal(el, val) {
+    const proto = el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, val);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  const host = location.hostname;
+  const path = location.pathname;
+
+  /* ============ STAGE 1: landing slcm ============ */
+  if (host === "slcm.ui.ac.id" && (path === "/" || path === "")) {
+    poll(() => {
+      const now = Date.now();
+      if (now > T_END) return false;
+      const keluar = tombolTeks(/^logout$/i);
+      const masuk = tombolTeks(/^(login|masuk)$/i);
+
+      if (now < T) {
+        if (keluar) { log(dt(), "sesi awal terdeteksi → logout sekarang"); keluar.click(); }
+        return false;
+      }
+      if (masuk) { log(dt(), "klik tombol Login/Masuk"); masuk.click(); return true; }
+      if (keluar) { log(dt(), "sudah login (sesi dibuat setelah T) → lompat ke IRS");
+        location.assign(URL_IRS); return true; }
+      return false;
+    });
+  }
+
+  /* ============ STAGE 2: halaman SSO ============ */
+  else if (host === "login.ui.ac.id") {
+    poll(() => {
+      const now = Date.now();
+      if (now > T_END || now < T) return false;
+      const u = document.querySelector("input[placeholder*='Username' i]") ||
+                document.querySelector("input[type='text']");
+      const p = document.querySelector("input[type='password']");
+      const b = tombolTeks(/^sign\s*in$/i);
+      if (!u || !p || !b) return false;
+      setVal(u, CONFIG.username);
+      setVal(p, CONFIG.password);
+      log(dt(), "isi kredensial & submit SSO");
+      b.click();
+      return true;
+    });
+  }
+
+  /* ============ STAGE 3: portal "Pilih Tujuan Anda" ============ */
+  else if (host === "slcm.ui.ac.id" && path.startsWith("/portal")) {
+    let klikDone = false;
+    poll(() => {
+      const now = Date.now();
+      if (now > T_END) return false;
+      if (now < T) {
+        const keluar = tombolTeks(/^logout$/i);
+        if (keluar) { log(dt(), "sesi awal terdeteksi → logout sekarang"); keluar.click(); }
+        return false;
+      }
+      const daun = [...document.querySelectorAll("h1,h2,h3,h4,h5,div,span,p,b,strong")]
+        .find((el) => el.childElementCount === 0 && el.textContent.trim() === "Akademik");
+      if (!daun) return false;
+      let el = daun;
+      for (let i = 0; i < 6 && el; i++) {
+        if (el.tagName === "A" || getComputedStyle(el).cursor === "pointer") break;
+        el = el.parentElement;
+      }
+      (el || daun).click();
+      log(dt(), "klik kartu Akademik");
+      klikDone = true;
+      return true;
+    }, timeoutDinamis(), 200);
+
+    setTimeout(() => {
+      if (!klikDone && Date.now() >= T && Date.now() <= T_END &&
+          location.pathname.startsWith("/portal")) {
+        log(dt(), "kartu tidak ketemu → fallback home akademik");
+        location.assign(URL_HOME_AKADEMIK);
+      }
+    }, Math.max(0, T - Date.now()) + 3000);
+  }
+
+  /* ============ STAGE 4: halaman akademik (bukan IRS) ============ */
+  else if (host === "slcm.ui.ac.id" && path.startsWith("/akademik") &&
+           !path.includes("pengisian-irs")) {
+    const entryTime = Date.now();
+    let oidcWaitLogged = false;
+    let graceStartOidc = 0;
+
+    poll(() => {
+      const now = Date.now();
+      if (now > T_END) return false;
+      if (now < T) {
+        log(dt(), "sesi awal terdeteksi di akademik → ke landing untuk logout");
+        location.assign("/");
+        return true;
+      }
+
+      // PENTING: Grace period 2 detik. Biarkan Keycloak inisialisasi dan trigger redirect jika perlu.
+      if (now - entryTime < 2000 && !/[?&](state|code|session_state)=/.test(location.search)) {
+        return false; // Tahan, jangan redirect dulu
+      }
+
+      // Kalau URL mengandung state/code, berarti sedang di tengah callback OIDC. Tunggu sampai bersih.
+      if (/[?&](state|code|session_state)=/.test(location.search)) {
+        if (!oidcWaitLogged) {
+          log(dt(), "OIDC callback terdeteksi, tunggu selesai...");
+          oidcWaitLogged = true;
+          graceStartOidc = now;
+        }
+        // Fallback: kalau URL tidak kunjung bersih setelah 4 detik, paksa ke IRS
+        if (now - graceStartOidc > 4000) {
+          log(dt(), "URL tidak kunjung bersih, paksa ke IRS");
+          location.assign(URL_IRS);
+          return true;
+        }
+        return false;
+      }
+
+      log(dt(), "menuju halaman pengisian IRS");
+      location.assign(URL_IRS);
+      return true;
+    }, timeoutDinamis(), 200);
+  }
+
+  /* Halaman pengisian-irs SENGAJA tidak disentuh navigator. */
+})();
