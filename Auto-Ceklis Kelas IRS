@@ -1,0 +1,43 @@
+// ==UserScript==
+// @name         Auto-Ceklis Kelas IRS
+// @version      1.8
+// @match        https://slcm.ui.ac.id/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  // Nama EKSAK seperti yang tertera di link (tanpa prefiks "Kelas ")
+  const incaran = [
+    "Alin A",
+    "Analisis Numerik A",
+    "Basis Data A",
+    "Banjut A",
+    "Computer Vision B",
+  ];
+
+  const target = new Set(incaran.map((t) => t.toLowerCase()));
+  const diproses = new WeakSet();
+
+  function ceklis() {
+    document.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+      if (diproses.has(cb)) return;
+      const row = cb.closest("tr");
+      if (!row) return;
+      const sel = row.querySelectorAll("td");
+      if (sel.length < 6) return;
+      const link = sel[1].querySelector("a");
+      if (!link) return;
+      const nama = link.textContent.trim();
+      if (!target.has(nama.toLowerCase())) return;
+      diproses.add(cb);
+      if (!cb.checked) cb.click(); // hanya menceklis, tidak pernah menghapus
+      console.log("[auto-ceklis] ✔", nama);
+    });
+  }
+
+  ceklis();
+  setInterval(ceklis, 250);
+})();
