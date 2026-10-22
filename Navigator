@@ -17,7 +17,7 @@
   const CONFIG = {
     defaultUser: "",
     defaultPass: "",
-    jamWar: "17:41:00",   // GANTI sesuai jadwal (HH:MM:SS). Untuk tes: set 3-5 menit ke depan.
+    jamWar: "09:00:00",   // GANTI sesuai jadwal (HH:MM:SS). Untuk tes: set 3-5 menit ke depan.
     delayDetik: 1,        // Jeda aman setelah jamWar
     jendelaMenit: 15,
     directToIrsFromLanding: true,
@@ -46,6 +46,14 @@
   const URL_AKADEMIK_ROOT = "https://slcm.ui.ac.id/akademik/";
 
   const log = (...a) => console.log("[auto-war]", ...a);
+
+  // Diagnostik: cek apakah aplikasi menulis ulang key setelah purge
+  try {
+    if (GM_getValue("irs_purged", "") && location.hostname === "slcm.ui.ac.id") {
+      console.log("[auto-war] Cek pasca-purge, key Local Storage saat halaman berikutnya dimuat:", Object.keys(localStorage));
+      GM_deleteValue("irs_purged");
+    }
+  } catch {}
 
   const [hh, mm, ss] = CONFIG.jamWar.split(":").map(Number);
   const W = (() => {
@@ -128,11 +136,14 @@
 
   // Token sisa di Local Storage setelah logout bisa menipu deteksi "sesi aktif".
   function purgeTokens() {
+    const sebelum = Object.keys(localStorage);
     ["kcToken", "kcRefreshToken", "kcIdToken", "xAppToken", "user",
      "userRoleAkademik", "userRoleNameAkademik", "userOrgCodeAkademik",
      "lastActivityAt", "sessionExpiresAt"].forEach((k) => {
       try { localStorage.removeItem(k); } catch {}
     });
+    log(dt(), "Purge token → key sebelum:", sebelum, "| sesudah:", Object.keys(localStorage));
+    try { GM_setValue("irs_purged", "1"); } catch {}
   }
 
   // Logout deterministik via endpoint Keycloak (tanpa menunggu tombol Logout muncul).
