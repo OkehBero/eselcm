@@ -1,10 +1,13 @@
 // ==UserScript==
-// @name         Auto War IRS UI — Navigator (Login → Portal → IRS)
-// @version      2.3
+// @name         Auto War IRS UI — Navigator (v4.3)
+// @version      4.3
 // @match        https://slcm.ui.ac.id/*
 // @match        https://login.ui.ac.id/*
 // @run-at       document-idle
-// @grant        none
+// @noframes
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // ==/UserScript==
 
 (function () {
@@ -12,171 +15,470 @@
 
   /* ================= KONFIGURASI ================= */
   const CONFIG = {
-    username: "USERNAME",
-    password: "PASSWORD",
-    jamWar: "00:00:00",
-    delayDetik: 3,
+    defaultUser: "",
+    defaultPass: "",
+    jamWar: "17:41:00",   // GANTI sesuai jadwal (HH:MM:SS). Untuk tes: set 3-5 menit ke depan.
+    delayDetik: 1,        // Jeda aman setelah jamWar
     jendelaMenit: 15,
+    directToIrsFromLanding: true,
+
+    // --- Baru di v4.2 ---
+    stagingDetik: 50,       // Mulai parkir di form login SSO sekian detik sebelum T
+    maxLoginTry: 2,         // Batas submit kredensial (anti lockout)
+    toleransiSesiMs: 2000,  // Toleransi selisih jam browser vs server saat cek sesi basi
+    maxBounce: 3,           // Batas logout otomatis berulang (anti loop)
   };
 
-  const URL_IRS = "https://slcm.ui.ac.id/akademik/pengisian-irs?optimized=true";
-  const URL_HOME_AKADEMIK = "https://slcm.ui.ac.id/akademik/student/home";
+  let username = GM_getValue("irs_user", "") || CONFIG.defaultUser;
+  let password = GM_getValue("irs_pass", "") || CONFIG.defaultPass;
 
-  /* ================= UTIL ================= */
+  if (!username || !password) {
+    username = prompt("Masukkan Username SSO UI:") || "";
+    password = prompt("Masukkan Password SSO UI:") || "";
+    if (username && password) {
+      GM_setValue("irs_user", username);
+      GM_setValue("irs_pass", password);
+    }
+  }
+
+  const PATH_IRS = "/akademik/pengisian-irs?optimized=true";
+  const URL_IRS = "https://slcm.ui.ac.id" + PATH_IRS;
+  const URL_AKADEMIK_ROOT = "https://slcm.ui.ac.id/akademik/";
+
   const log = (...a) => console.log("[auto-war]", ...a);
 
   const [hh, mm, ss] = CONFIG.jamWar.split(":").map(Number);
-  const T = (() => { const d = new Date(); d.setHours(hh, mm, ss, 0);
-    return d.getTime() + CONFIG.delayDetik * 1000; })();
+  const W = (() => {
+    const d = new Date();
+    d.setHours(hh, mm, ss, 0);
+    return d.getTime(); // jam war murni (tanpa delay)
+  })();
+  const T = W + CONFIG.delayDetik * 1000;
   const T_END = T + CONFIG.jendelaMenit * 60_000;
 
   const dt = () => {
     const s = (Date.now() - T) / 1000;
-    return (s >= 0 ? "T+" : "T-") + Math.abs(s).toFixed(1) + "s";
+    return (s >= 0 ? "T+" : "T-") + Math.abs(s).toFixed(2) + "s";
   };
 
-  const timeoutDinamis = () => Math.max(120_000, T_END - Date.now() + 60_000);
-
-  function poll(fn, timeout, interval = 100) {
-    const start = Date.now();
-    const lim = timeout ?? timeoutDinamis();
-    const iv = setInterval(() => {
-      let ok = false;
-      try { ok = fn(); } catch (e) {}
-      if (ok) clearInterval(iv);
-      else if (Date.now() - start > lim) { clearInterval(iv); log("poll timeout"); }
-    }, interval);
+  /* ================= TELEMETRI (lintas origin via GM_*) ================= */
+  function resetTelemetri() {
+    try { GM_deleteValue("irs_telemetry"); } catch {}
   }
 
+  function catatTelemetri(tahap) {
+    try {
+      const raw = GM_getValue("irs_telemetry", "");
+      const data = raw ? JSON.parse(raw) : { start: Date.now(), logs: [] };
+      data.logs.push({
+        tahap,
+        waktuRelatifTarget: dt(),
+        elapsedMs: Date.now() - data.start,
+      });
+      GM_setValue("irs_telemetry", JSON.stringify(data));
+    } catch {}
+  }
+
+  function cetakLaporanAkhir() {
+    try {
+      const raw = GM_getValue("irs_telemetry", "");
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      console.log(
+        "%c🏁 [BENCHMARK NAVIGATOR v4.2 SELESAI]",
+        "color: #00e676; font-weight: bold; font-size: 14px;"
+      );
+      console.table(data.logs);
+      GM_deleteValue("irs_telemetry");
+    } catch {}
+  }
+
+  /* ================= BATAS PERCOBAAN LOGIN ================= */
+  function ambilTry() {
+    try {
+      const o = JSON.parse(GM_getValue("irs_login_try", "{}"));
+      if (!o.t || Date.now() - o.t > 30 * 60_000) return 0; // kedaluwarsa 30 menit
+      return o.n || 0;
+    } catch {
+      return 0;
+    }
+  }
+  function tambahTry() {
+    GM_setValue("irs_login_try", JSON.stringify({ n: ambilTry() + 1, t: Date.now() }));
+  }
+  function resetTry() {
+    try { GM_deleteValue("irs_login_try"); } catch {}
+  }
+
+  /* ================= ANTI LOOP LOGOUT ================= */
+  function bounceBoleh() {
+    try {
+      const o = JSON.parse(GM_getValue("irs_bounce", "{}"));
+      const n = !o.t || Date.now() - o.t > 30 * 60_000 ? 0 : o.n || 0;
+      if (n >= CONFIG.maxBounce) return false;
+      GM_setValue("irs_bounce", JSON.stringify({ n: n + 1, t: Date.now() }));
+      return true;
+    } catch {
+      return true;
+    }
+  }
+  function resetBounce() {
+    try { GM_deleteValue("irs_bounce"); } catch {}
+  }
+
+  // Token sisa di Local Storage setelah logout bisa menipu deteksi "sesi aktif".
+  function purgeTokens() {
+    ["kcToken", "kcRefreshToken", "kcIdToken", "xAppToken", "user",
+     "userRoleAkademik", "userRoleNameAkademik", "userOrgCodeAkademik",
+     "lastActivityAt", "sessionExpiresAt"].forEach((k) => {
+      try { localStorage.removeItem(k); } catch {}
+    });
+  }
+
+  // Logout deterministik via endpoint Keycloak (tanpa menunggu tombol Logout muncul).
+  // Return true = berhenti total (batas bounce tercapai), false = lanjut.
+  function keluarSesi(alasan) {
+    if (!bounceBoleh()) {
+      log(dt(), "Batas logout otomatis tercapai. Navigator berhenti, ambil alih manual.");
+      return true;
+    }
+    kunciAksi(alasan);
+    const idt = localStorage.getItem("kcIdToken");
+    if (idt) {
+      location.assign(
+        "https://login.ui.ac.id/realms/main/protocol/openid-connect/logout" +
+          "?client_id=slcm-akademik" +
+          "&post_logout_redirect_uri=" + encodeURIComponent("https://slcm.ui.ac.id") +
+          "&id_token_hint=" + encodeURIComponent(idt)
+      );
+    } else {
+      location.assign("/");
+    }
+    return false;
+  }
+
+  /* ================= UTILITAS DOM & TOKEN ================= */
   function tombolTeks(re) {
-    return [...document.querySelectorAll("a,button,input[type='submit']")]
-      .find((el) => re.test(el.textContent.trim()));
+    return [...document.querySelectorAll("a,button,input[type='submit']")].find((el) => {
+      const text = el.tagName === "INPUT" ? el.value : el.textContent;
+      return re.test((text || "").trim()) && !el.disabled;
+    });
   }
 
   function setVal(el, val) {
-    const proto = el instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, val);
+    const proto =
+      el instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(el, val);
+    else el.value = val;
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  const host = location.hostname;
-  const path = location.pathname;
+  function sesiAkademikLengkap() {
+    return Boolean(
+      localStorage.getItem("kcToken") &&
+        localStorage.getItem("xAppToken") &&
+        localStorage.getItem("userRoleAkademik")
+    );
+  }
 
-  /* ============ STAGE 1: landing slcm ============ */
-  if (host === "slcm.ui.ac.id" && (path === "/" || path === "")) {
-    poll(() => {
-      const now = Date.now();
-      if (now > T_END) return false;
-      const keluar = tombolTeks(/^logout$/i);
+  // Waktu login ASLI (claim auth_time, detik jam server) dari kcToken. null jika tidak ada.
+  function authTimeMs() {
+    try {
+      const t = localStorage.getItem("kcToken");
+      if (!t) return null;
+      const b = t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      const p = JSON.parse(atob(b));
+      return p.auth_time ? p.auth_time * 1000 : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Sesi dianggap basi jika login terjadi sebelum jam war, atau waktunya tidak bisa dipastikan.
+  function sesiBasi() {
+    const a = authTimeMs();
+    if (a === null) return true;
+    return a < W - CONFIG.toleransiSesiMs;
+  }
+
+  function navigasiMulusKeIrs() {
+    const linkSpa = document.querySelector('a[href*="/akademik/pengisian-irs"]');
+    if (linkSpa) {
+      log(dt(), "Transisi SPA via elemen <a> NuxtLink");
+      linkSpa.click();
+      return;
+    }
+    try {
+      const nuxtRouter = window.useNuxtApp?.()?.$router || window.$nuxt?.$router;
+      if (nuxtRouter) {
+        log(dt(), "Transisi SPA via Nuxt Router");
+        nuxtRouter.push("/pengisian-irs?optimized=true");
+        return;
+      }
+    } catch {}
+    location.assign(URL_IRS);
+  }
+
+  /* ================= SMART COOLDOWN ================= */
+  let waktuAksiTerakhir = 0;
+  let urlSaatAksi = "";
+  let waktuMulaiOidc = 0;
+  let waktuMasukAkademik = 0;
+  let waktuKlikPortal = 0;
+
+  function sedangCooldown(durasiMs = 4000) {
+    if (location.href !== urlSaatAksi) return false;
+    return Date.now() - waktuAksiTerakhir < durasiMs;
+  }
+
+  function kunciAksi(pesan) {
+    waktuAksiTerakhir = Date.now();
+    urlSaatAksi = location.href;
+    if (pesan) {
+      log(dt(), pesan);
+      catatTelemetri(pesan);
+    }
+  }
+
+  /* ================= ENGINE EKSEKUSI ================= */
+  let sudahLaporGagalLogin = false;
+
+  function evaluasiNavigasi() {
+    const now = Date.now();
+    if (now > T_END) return true;
+
+    // Auto Reload jika 502/503/504 saat jam war
+    if (
+      now >= T &&
+      /(502 Bad Gateway|504 Gateway Time-out|503 Service)/i.test(
+        document.title + " " + (document.body?.innerText || "").slice(0, 300)
+      )
+    ) {
+      if (!sedangCooldown(2500)) {
+        kunciAksi("Server Error 502/503/504 → Auto Reload");
+        location.reload();
+      }
+      return false;
+    }
+
+    const host = location.hostname;
+    const path = location.pathname;
+    const search = location.search;
+    const hash = location.hash;
+
+    // PROTEKSI OIDC CALLBACK
+    if (
+      host === "slcm.ui.ac.id" &&
+      (/[?&](state|code|session_state)=/.test(search) ||
+        /[#&](state|code|session_state)=/.test(hash))
+    ) {
+      if (!waktuMulaiOidc) {
+        waktuMulaiOidc = now;
+        log(dt(), "OIDC callback aktif, menunggu pertukaran token...");
+      }
+      if (now - waktuMulaiOidc > 4500 && now >= T) {
+        waktuMulaiOidc = 0;
+        kunciAksi("OIDC callback > 4.5s → paksa ke IRS");
+        location.assign(URL_IRS);
+      }
+      return false;
+    } else {
+      waktuMulaiOidc = 0;
+    }
+
+    // GARIS FINISH: Halaman Pengisian IRS
+    if (host === "slcm.ui.ac.id" && path.includes("pengisian-irs")) {
+      if (now < T) {
+        // Belum ada sesi → biarkan Nuxt melempar ke SSO (pre-stage). Ada sesi → logout dulu.
+        if (!sesiAkademikLengkap()) return false;
+        if (sedangCooldown(4000)) return false;
+        return keluarSesi("Pre-war di IRS dengan token aktif → logout");
+      }
+      if (sesiAkademikLengkap()) {
+        if (sesiBasi()) {
+          if (sedangCooldown(4000)) return false;
+          return keluarSesi("Sesi basi (login sebelum jam war) di IRS → logout");
+        }
+        catatTelemetri("Tiba di Halaman Pengisian IRS (Sesi Lengkap & Fresh)");
+        cetakLaporanAkhir();
+        resetTry();
+        resetBounce();
+        return true; // Hentikan Navigator agar tidak mengganggu Cloudflare Turnstile
+      }
+      return false;
+    }
+
+    // Fallback cepat di /portal
+    if (
+      host === "slcm.ui.ac.id" &&
+      path.startsWith("/portal") &&
+      waktuKlikPortal > 0 &&
+      now - waktuKlikPortal > 800
+    ) {
+      waktuKlikPortal = 0;
+      kunciAksi("Stage 3 Fallback (800ms): Bypass langsung ke IRS");
+      location.assign(URL_IRS);
+      return false;
+    }
+
+    if (sedangCooldown(4000)) return false;
+
+    // STAGE 1: Landing SLCM (/)
+    if (host === "slcm.ui.ac.id" && (path === "/" || path === "")) {
+      const keluar = tombolTeks(/^(logout|keluar)$/i);
       const masuk = tombolTeks(/^(login|masuk)$/i);
 
       if (now < T) {
-        if (keluar) { log(dt(), "sesi awal terdeteksi → logout sekarang"); keluar.click(); }
+        if (keluar) {
+          kunciAksi("Pre-war logout di Landing");
+          keluar.click();
+        } else if (masuk && now >= T - CONFIG.stagingDetik * 1000) {
+          resetTelemetri();
+          purgeTokens();
+          kunciAksi("Pre-stage: parkir di form SSO (prefill, tanpa submit)");
+          location.assign(URL_IRS);
+        }
         return false;
       }
-      if (masuk) { log(dt(), "klik tombol Login/Masuk"); masuk.click(); return true; }
-      if (keluar) { log(dt(), "sudah login (sesi dibuat setelah T) → lompat ke IRS");
-        location.assign(URL_IRS); return true; }
-      return false;
-    });
-  }
 
-  /* ============ STAGE 2: halaman SSO ============ */
-  else if (host === "login.ui.ac.id") {
-    poll(() => {
-      const now = Date.now();
-      if (now > T_END || now < T) return false;
-      const u = document.querySelector("input[placeholder*='Username' i]") ||
-                document.querySelector("input[type='text']");
+      if (masuk) {
+        if (!ambilTry()) resetTelemetri();
+        purgeTokens();
+        if (CONFIG.directToIrsFromLanding) {
+          kunciAksi("Stage 1: Direct Target ke /akademik/pengisian-irs (Opsi A)");
+          location.assign(URL_IRS);
+        } else {
+          kunciAksi("Stage 1: Direct Bypass ke /akademik/");
+          location.assign(URL_AKADEMIK_ROOT);
+        }
+        return false;
+      }
+
+      if (keluar) {
+        if (sesiBasi()) {
+          kunciAksi("Stage 1: Sesi lama/tidak pasti → Logout dulu");
+          keluar.click();
+        } else {
+          kunciAksi("Stage 1: Sesi fresh (login setelah jam war) → langsung ke IRS");
+          location.assign(URL_IRS);
+        }
+        return false;
+      }
+    }
+
+    // STAGE 2: Halaman SSO (login.ui.ac.id)
+    else if (host === "login.ui.ac.id") {
+      const u =
+        document.querySelector("input[placeholder*='Username' i]") ||
+        document.querySelector("input[type='text']");
       const p = document.querySelector("input[type='password']");
       const b = tombolTeks(/^sign\s*in$/i);
-      if (!u || !p || !b) return false;
-      setVal(u, CONFIG.username);
-      setVal(p, CONFIG.password);
-      log(dt(), "isi kredensial & submit SSO");
-      b.click();
-      return true;
-    });
-  }
 
-  /* ============ STAGE 3: portal "Pilih Tujuan Anda" ============ */
-  else if (host === "slcm.ui.ac.id" && path.startsWith("/portal")) {
-    let klikDone = false;
-    poll(() => {
-      const now = Date.now();
-      if (now > T_END) return false;
-      if (now < T) {
-        const keluar = tombolTeks(/^logout$/i);
-        if (keluar) { log(dt(), "sesi awal terdeteksi → logout sekarang"); keluar.click(); }
+      // Form tidak ada: mungkin halaman "expired"
+      if (!u || !p || !b) {
+        const teks = (document.body?.innerText || "").slice(0, 500);
+        if (/page has expired|restart login|kedaluwarsa/i.test(teks) && !sedangCooldown(4000)) {
+          kunciAksi("Halaman login expired → reload lewat URL IRS");
+          location.assign(URL_IRS);
+        }
         return false;
       }
-      const daun = [...document.querySelectorAll("h1,h2,h3,h4,h5,div,span,p,b,strong")]
-        .find((el) => el.childElementCount === 0 && el.textContent.trim() === "Akademik");
-      if (!daun) return false;
-      let el = daun;
-      for (let i = 0; i < 6 && el; i++) {
-        if (el.tagName === "A" || getComputedStyle(el).cursor === "pointer") break;
-        el = el.parentElement;
-      }
-      (el || daun).click();
-      log(dt(), "klik kartu Akademik");
-      klikDone = true;
-      return true;
-    }, timeoutDinamis(), 200);
+      if (!username || !password) return false;
 
-    setTimeout(() => {
-      if (!klikDone && Date.now() >= T && Date.now() <= T_END &&
-          location.pathname.startsWith("/portal")) {
-        log(dt(), "kartu tidak ketemu → fallback home akademik");
-        location.assign(URL_HOME_AKADEMIK);
-      }
-    }, Math.max(0, T - Date.now()) + 3000);
-  }
+      // Prefill selama menunggu (tanpa klik)
+      if (u.value !== username) setVal(u, username);
+      if (p.value !== password) setVal(p, password);
 
-  /* ============ STAGE 4: halaman akademik (bukan IRS) ============ */
-  else if (host === "slcm.ui.ac.id" && path.startsWith("/akademik") &&
-           !path.includes("pengisian-irs")) {
-    const entryTime = Date.now();
-    let oidcWaitLogged = false;
-    let graceStartOidc = 0;
+      if (now < T) return false;
 
-    poll(() => {
-      const now = Date.now();
-      if (now > T_END) return false;
-      if (now < T) {
-        log(dt(), "sesi awal terdeteksi di akademik → ke landing untuk logout");
-        location.assign("/");
+      if (ambilTry() >= CONFIG.maxLoginTry) {
+        if (!sudahLaporGagalLogin) {
+          sudahLaporGagalLogin = true;
+          log(dt(), "Batas percobaan login tercapai. Navigator berhenti. Cek kredensial / ambil alih manual.");
+        }
         return true;
       }
+      tambahTry();
+      kunciAksi("Stage 2: Submit Kredensial SSO (percobaan ke-" + ambilTry() + ")");
+      b.click();
+    }
 
-      // PENTING: Grace period 2 detik. Biarkan Keycloak inisialisasi dan trigger redirect jika perlu.
-      if (now - entryTime < 2000 && !/[?&](state|code|session_state)=/.test(location.search)) {
-        return false; // Tahan, jangan redirect dulu
-      }
-
-      // Kalau URL mengandung state/code, berarti sedang di tengah callback OIDC. Tunggu sampai bersih.
-      if (/[?&](state|code|session_state)=/.test(location.search)) {
-        if (!oidcWaitLogged) {
-          log(dt(), "OIDC callback terdeteksi, tunggu selesai...");
-          oidcWaitLogged = true;
-          graceStartOidc = now;
-        }
-        // Fallback: kalau URL tidak kunjung bersih setelah 4 detik, paksa ke IRS
-        if (now - graceStartOidc > 4000) {
-          log(dt(), "URL tidak kunjung bersih, paksa ke IRS");
-          location.assign(URL_IRS);
-          return true;
+    // STAGE 3: Portal (/portal)
+    else if (host === "slcm.ui.ac.id" && path.startsWith("/portal")) {
+      if (now < T) {
+        const keluar = tombolTeks(/^(logout|keluar)$/i);
+        if (keluar) {
+          kunciAksi("Pre-war logout di Portal");
+          keluar.click();
         }
         return false;
       }
 
-      log(dt(), "menuju halaman pengisian IRS");
-      location.assign(URL_IRS);
-      return true;
-    }, timeoutDinamis(), 200);
+      const daun = [...document.querySelectorAll("h1,h2,h3,h4,h5,div,span,p,b,strong")].find(
+        (el) => el.childElementCount === 0 && el.textContent.trim() === "Akademik"
+      );
+
+      if (daun) {
+        let el = daun;
+        for (let i = 0; i < 6 && el; i++) {
+          if (el.tagName === "A" || getComputedStyle(el).cursor === "pointer") break;
+          el = el.parentElement;
+        }
+        kunciAksi("Stage 3: Klik Kartu Akademik");
+        waktuKlikPortal = now;
+        (el || daun).click();
+      }
+    }
+
+    // STAGE 4: Halaman Akademik (/akademik/ selain pengisian-irs)
+    else if (host === "slcm.ui.ac.id" && path.startsWith("/akademik")) {
+      if (now < T) {
+        kunciAksi("Pre-war di Akademik → kembali ke Landing untuk Logout");
+        location.assign("/");
+        return false;
+      }
+
+      if (!waktuMasukAkademik) waktuMasukAkademik = now;
+
+      if (localStorage.getItem("kcToken") && sesiBasi()) {
+        return keluarSesi("Stage 4: Sesi basi → logout");
+      }
+
+      if (sesiAkademikLengkap()) {
+        kunciAksi("Stage 4: Sesi Lengkap (xAppToken Ready) → Pindah ke IRS");
+        navigasiMulusKeIrs();
+        return false;
+      }
+
+      if (now - waktuMasukAkademik > 2500 && localStorage.getItem("kcToken")) {
+        kunciAksi("Stage 4 Fallback (2.5s): Pindah ke IRS dengan kcToken");
+        navigasiMulusKeIrs();
+        return false;
+      }
+    }
+
+    return false;
   }
 
-  /* Halaman pengisian-irs SENGAJA tidak disentuh navigator. */
+  /* ================= LOOP & OBSERVER (dengan throttle) ================= */
+  let lastEval = 0;
+  function jalankan() {
+    const n = performance.now();
+    if (n - lastEval < 20) return;
+    lastEval = n;
+    if (evaluasiNavigasi()) {
+      clearInterval(iv);
+      observer.disconnect();
+    }
+  }
+
+  const iv = setInterval(jalankan, 25);
+  const observer = new MutationObserver(jalankan);
+  if (document.documentElement) {
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
 })();
